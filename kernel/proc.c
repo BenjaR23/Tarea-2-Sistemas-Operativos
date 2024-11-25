@@ -5,6 +5,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include <stddef.h>
+#include <stdarg.h>
+
 
 struct cpu cpus[NCPU];
 
@@ -111,43 +114,49 @@ allocproc(void)
 {
   struct proc *p;
 
+  // Recorremos el arreglo de procesos buscando un espacio UNUSED
   for(p = proc; p < &proc[NPROC]; p++) {
-    acquire(&p->lock);
+    acquire(&p->lock);  // Adquirir el bloqueo para el proceso
+
+    // Verificamos si el proceso está en estado UNUSED
     if(p->state == UNUSED) {
-      goto found;
+      // Inicializamos los campos del proceso
+      p->priority = 0;
+      p->boost = 1;
+      p->pid = allocpid();  // Asignamos un PID
+      p->state = USED;  // Marcamos el proceso como USED
+
+      // Intentamos asignar memoria para el trapframe del proceso
+      if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+        freeproc(p);  // Liberamos el proceso si no conseguimos memoria
+        release(&p->lock);  // Liberamos el bloqueo antes de retornar
+        return 0;  // Fallo al asignar memoria
+      }
+
+      // Intentamos asignar la tabla de páginas del proceso
+      p->pagetable = proc_pagetable(p);
+      if(p->pagetable == 0){
+        freeproc(p);  // Liberamos el proceso si no conseguimos la tabla de páginas
+        release(&p->lock);  // Liberamos el bloqueo antes de retornar
+        return 0;  // Fallo al asignar la tabla de páginas
+      }
+
+      // Configuramos el contexto para el proceso, de modo que empiece en forkret
+      memset(&p->context, 0, sizeof(p->context));
+      p->context.ra = (uint64)forkret;
+      p->context.sp = p->kstack + PGSIZE;
+
+      release(&p->lock);  // Liberamos el bloqueo después de configurar el proceso
+      return p;  // Devolvemos el proceso recién asignado
     } else {
+      // Si el proceso no está en estado UNUSED, liberamos el bloqueo para pasar al siguiente proceso
       release(&p->lock);
     }
   }
-  return 0;
 
-found:
-  p->pid = allocpid();
-  p->state = USED;
-
-  // Allocate a trapframe page.
-  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
-    freeproc(p);
-    release(&p->lock);
-    return 0;
-  }
-
-  // An empty user page table.
-  p->pagetable = proc_pagetable(p);
-  if(p->pagetable == 0){
-    freeproc(p);
-    release(&p->lock);
-    return 0;
-  }
-
-  // Set up new context to start executing at forkret,
-  // which returns to user space.
-  memset(&p->context, 0, sizeof(p->context));
-  p->context.ra = (uint64)forkret;
-  p->context.sp = p->kstack + PGSIZE;
-
-  return p;
+  return 0;  // No se encontró un proceso UNUSED disponible
 }
+
 
 // free a proc structure and the data hanging from it,
 // including user pages.
@@ -279,7 +288,7 @@ growproc(int n)
 int
 fork(void)
 {
-  int i, pid;
+  int i;
   struct proc *np;
   struct proc *p = myproc();
 
@@ -287,6 +296,19 @@ fork(void)
   if((np = allocproc()) == 0){
     return -1;
   }
+
+  np->state = RUNNABLE;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    if(p->state != ZOMBIE) {
+      p->priority += p->boost;
+    }
+  }
+
+  np->pid = allocpid();
+  np->parent = myproc();
+  np->priority = 0;
+  np->boost = 1;
 
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
@@ -310,8 +332,6 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
-  pid = np->pid;
-
   release(&np->lock);
 
   acquire(&wait_lock);
@@ -322,7 +342,7 @@ fork(void)
   np->state = RUNNABLE;
   release(&np->lock);
 
-  return pid;
+  return np->pid;
 }
 
 // Pass p's abandoned children to init.
@@ -445,6 +465,38 @@ void
 scheduler(void)
 {
   struct proc *p;
+  struct proc *selected_proc = NULL;
+  int highest_priority = 10;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    if(p->state == RUNNABLE) {
+      if(p->priority < 9) {
+        p->priority += p->boost;
+      }
+
+      if(p->priority >= 9) {
+        p->boost = -1;
+      } else if(p->priority <= 0) {
+        p->boost = 1;
+      }
+
+      if(p->priority < highest_priority) {
+        highest_priority = p->priority;
+        selected_proc = p;
+      }
+    }
+  }
+
+  if(selected_proc != NULL) {
+    printf("Ejecutando proceso %s %d\n", selected_proc->name, selected_proc->pid);
+
+    struct cpu *current_cpu = mycpu();
+
+    selected_proc->state = RUNNING;
+    current_cpu->proc = selected_proc;
+    swtch(&current_cpu->proc->context, &selected_proc->context);
+  }
+
   struct cpu *c = mycpu();
 
   c->proc = 0;
